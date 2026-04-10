@@ -15,12 +15,13 @@ use syntaqlite::fmt::FormatError;
 use syntaqlite::fmt::KeywordCase;
 use syntaqlite::semantic::DiagnosticMessage;
 use syntaqlite::semantic::Severity;
+use syntaqlite::semantic::{AritySpec, CatalogLayer, FunctionCategory};
 use syntaqlite::util::DiagnosticRenderer;
 use syntaqlite::{
     Catalog, Diagnostic, FormatConfig, Formatter, SemanticAnalyzer, ValidationConfig,
 };
 
-use crate::config::{self, FormatOptions, ProjectConfig};
+use crate::config::{self, FormatOptions, FunctionDecl, ProjectConfig};
 
 use super::{Cli, Command};
 
@@ -186,6 +187,10 @@ fn dispatch_commands(
                 &warn,
                 &deny,
             )?;
+            let functions = file_config
+                .as_ref()
+                .map(|(c, _)| c.functions.as_slice())
+                .unwrap_or_default();
             cmd_validate(
                 &d,
                 &files,
@@ -193,6 +198,7 @@ fn dispatch_commands(
                 &resolved_schemas,
                 lang,
                 checks,
+                functions,
             )
         }),
         Command::Lsp => require_dialect(dialect).and_then(|d| cmd_lsp(d, config)),
@@ -430,12 +436,13 @@ fn cmd_lsp(dialect: AnyDialect, config: &ConfigMode<'_>) -> Result<(), String> {
         ));
 
         // Build per-file schema map from [schemas] globs and top-level `schema` key.
+        let lsp_functions = project_config.functions.as_slice();
         let default_catalog = if let Some(ref schema) = project_config.schema {
             let paths: Vec<String> = schema
                 .iter()
                 .map(|s| config_dir.join(s).to_string_lossy().into_owned())
                 .collect();
-            match build_schema_catalog(&dialect, &paths) {
+            match build_schema_catalog(&dialect, &paths, lsp_functions) {
                 Ok(catalog) => Some(catalog),
                 Err(e) => {
                     eprintln!("syntaqlite-lsp: failed to load default schema: {e}");
@@ -459,7 +466,7 @@ fn cmd_lsp(dialect: AnyDialect, config: &ConfigMode<'_>) -> Result<(), String> {
                 .iter()
                 .map(|s| config_dir.join(s).to_string_lossy().into_owned())
                 .collect();
-            match build_schema_catalog(&dialect, &paths) {
+            match build_schema_catalog(&dialect, &paths, lsp_functions) {
                 Ok(catalog) => schema_entries.push((pattern, catalog)),
                 Err(e) => eprintln!("syntaqlite-lsp: failed to load schema for {glob_str:?}: {e}"),
             }
@@ -631,28 +638,78 @@ fn format_source(
     Formatter::with_dialect_config(dialect.clone(), config).format(source)
 }
 
-fn build_schema_catalog(dialect: &AnyDialect, schema_files: &[String]) -> Result<Catalog, String> {
-    if schema_files.is_empty() {
-        return Ok(Catalog::new(dialect.clone()));
+/// Register user-defined functions from config into the `Database` catalog layer.
+///
+/// `arity` absent or `-1` → [`AritySpec::Any`] (variadic).
+/// Non-negative integer → [`AritySpec::Exact`].
+fn apply_config_functions(catalog: &mut Catalog, functions: &[FunctionDecl]) -> Result<(), String> {
+    if functions.is_empty() {
+        return Ok(());
     }
-    let paths = expand_paths(schema_files)?;
-    let mut sources = Vec::new();
-    let mut uris = Vec::new();
-    for path in &paths {
-        let source =
-            fs::read_to_string(path).map_err(|e| format!("schema {}: {e}", path.display()))?;
-        uris.push(format!("file://{}", path.display()));
-        sources.push(source);
+    let layer = catalog.layer_mut(CatalogLayer::Database);
+    for decl in functions {
+        let category = match decl.kind.as_deref().unwrap_or("scalar") {
+            "scalar" => FunctionCategory::Scalar,
+            "aggregate" => FunctionCategory::Aggregate,
+            "window" => FunctionCategory::Window,
+            other => {
+                return Err(format!(
+                    "[[functions]]: unknown kind {other:?} for {:?}; \
+                     expected \"scalar\", \"aggregate\", or \"window\"",
+                    decl.name
+                ));
+            }
+        };
+        let arity = match decl.arity {
+            None | Some(-1) => AritySpec::Any,
+            Some(n) if n >= 0 => {
+                let count = usize::try_from(n).map_err(|_| {
+                    format!("[[functions]]: arity {n} is too large for {:?}", decl.name)
+                })?;
+                AritySpec::Exact(count)
+            }
+            Some(n) => {
+                return Err(format!(
+                    "[[functions]]: invalid arity {n} for {:?}; \
+                     use -1 (or omit) for variadic, or a non-negative integer for exact arity",
+                    decl.name
+                ));
+            }
+        };
+        layer.insert_function_overload(decl.name.as_str(), category, arity);
     }
-    let pairs: Vec<(&str, Option<&str>)> = sources
-        .iter()
-        .zip(uris.iter())
-        .map(|(s, u)| (s.as_str(), Some(u.as_str())))
-        .collect();
-    let (catalog, errors) = Catalog::from_ddl(dialect.clone(), &pairs);
-    for err in &errors {
-        eprintln!("warning: schema: {err}");
-    }
+    Ok(())
+}
+
+fn build_schema_catalog(
+    dialect: &AnyDialect,
+    schema_files: &[String],
+    functions: &[FunctionDecl],
+) -> Result<Catalog, String> {
+    let mut catalog = if schema_files.is_empty() {
+        Catalog::new(dialect.clone())
+    } else {
+        let paths = expand_paths(schema_files)?;
+        let mut sources = Vec::new();
+        let mut uris = Vec::new();
+        for path in &paths {
+            let source =
+                fs::read_to_string(path).map_err(|e| format!("schema {}: {e}", path.display()))?;
+            uris.push(format!("file://{}", path.display()));
+            sources.push(source);
+        }
+        let pairs: Vec<(&str, Option<&str>)> = sources
+            .iter()
+            .zip(uris.iter())
+            .map(|(s, u)| (s.as_str(), Some(u.as_str())))
+            .collect();
+        let (catalog, errors) = Catalog::from_ddl(dialect.clone(), &pairs);
+        for err in &errors {
+            eprintln!("warning: schema: {err}");
+        }
+        catalog
+    };
+    apply_config_functions(&mut catalog, functions)?;
     Ok(catalog)
 }
 
@@ -663,9 +720,10 @@ fn cmd_validate(
     schema_files: &[String],
     lang: Option<HostLanguage>,
     checks: syntaqlite::CheckConfig,
+    functions: &[FunctionDecl],
 ) -> Result<(), String> {
     let has_schema = !schema_files.is_empty();
-    let schema_catalog = build_schema_catalog(dialect, schema_files)?;
+    let schema_catalog = build_schema_catalog(dialect, schema_files, functions)?;
     let config = ValidationConfig::default().with_checks(checks);
     let mut any_errors = false;
     let mut any_diagnostics = false;
@@ -683,6 +741,7 @@ fn cmd_validate(
                         &config,
                         lang,
                         schema_files,
+                        functions,
                     );
                     (e, e)
                 }
@@ -707,6 +766,7 @@ fn cmd_validate(
                         &config,
                         lang,
                         schema_files,
+                        functions,
                     );
                     (e, e)
                 }
@@ -757,6 +817,7 @@ fn validate_embedded_source(
     config: &ValidationConfig,
     lang: HostLanguage,
     schema_files: &[String],
+    functions: &[FunctionDecl],
 ) -> bool {
     let fragments = match lang {
         HostLanguage::Python => syntaqlite::embedded::extract_python(source),
@@ -768,7 +829,7 @@ fn validate_embedded_source(
     }
 
     // Build an owned catalog for the embedded analyzer.
-    let catalog = match build_schema_catalog(dialect, schema_files) {
+    let catalog = match build_schema_catalog(dialect, schema_files, functions) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");

@@ -33,6 +33,11 @@ pub(crate) struct ProjectConfig {
     /// Per-category check toggles.
     #[serde(default)]
     pub checks: CheckOptions,
+
+    /// User-defined functions to register with the validator.
+    /// Declared as `[[functions]]` entries.
+    #[serde(default)]
+    pub functions: Vec<FunctionDecl>,
 }
 
 /// Per-category check levels from the `[checks]` section.
@@ -60,6 +65,40 @@ pub(crate) struct FormatOptions {
     pub indent_width: Option<usize>,
     pub keyword_case: Option<String>,
     pub semicolons: Option<bool>,
+}
+
+/// A user-defined function declared in `[[functions]]` for validation purposes.
+///
+/// Declared functions are registered with the semantic analyzer so that calls
+/// to them are accepted rather than flagged as `unknown-function`.
+///
+/// # Example
+///
+/// ```toml
+/// [[functions]]
+/// name = "my_scalar"
+/// arity = 2
+///
+/// [[functions]]
+/// name = "my_variadic"
+/// # arity absent (or -1) means variadic — any number of arguments accepted
+///
+/// [[functions]]
+/// name = "my_aggregate"
+/// kind = "aggregate"
+/// arity = 1
+/// ```
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) struct FunctionDecl {
+    /// Function name (matched case-insensitively, as `SQLite` treats function names).
+    pub name: String,
+    /// Number of arguments this function accepts.
+    /// Absent or `-1` means variadic (any number of arguments).
+    /// A non-negative integer means exactly that many arguments.
+    pub arity: Option<i64>,
+    /// Function kind: `"scalar"` (default), `"aggregate"`, or `"window"`.
+    pub kind: Option<String>,
 }
 
 /// Load config from an explicit file path.
@@ -318,5 +357,93 @@ semicolons = false
         assert!(!glob_match("src/**/*.sql", "tests/a.sql"));
         assert!(glob_match("migrations/*.sql", "migrations/001.sql"));
         assert!(!glob_match("migrations/*.sql", "migrations/a/001.sql"));
+    }
+
+    #[test]
+    fn parse_functions_array() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+[[functions]]
+name = "my_scalar"
+arity = 2
+
+[[functions]]
+name = "my_variadic"
+
+[[functions]]
+name = "my_aggregate"
+kind = "aggregate"
+arity = 1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.functions.len(), 3);
+
+        let scalar = &config.functions[0];
+        assert_eq!(scalar.name, "my_scalar");
+        assert_eq!(scalar.arity, Some(2));
+        assert!(scalar.kind.is_none());
+
+        let variadic = &config.functions[1];
+        assert_eq!(variadic.name, "my_variadic");
+        assert!(variadic.arity.is_none());
+        assert!(variadic.kind.is_none());
+
+        let aggregate = &config.functions[2];
+        assert_eq!(aggregate.name, "my_aggregate");
+        assert_eq!(aggregate.arity, Some(1));
+        assert_eq!(aggregate.kind.as_deref(), Some("aggregate"));
+    }
+
+    #[test]
+    fn parse_functions_empty_by_default() {
+        let config: ProjectConfig = toml::from_str("").unwrap();
+        assert!(config.functions.is_empty());
+    }
+
+    #[test]
+    fn parse_functions_negative_one_arity() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+[[functions]]
+name = "variadic_explicit"
+arity = -1
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.functions[0].arity, Some(-1));
+    }
+
+    #[test]
+    fn parse_full_config_with_functions() {
+        let config: ProjectConfig = toml::from_str(
+            r#"
+schema = ["schema.sql"]
+
+[[functions]]
+name = "ref"
+arity = -1
+
+[[functions]]
+name = "col"
+arity = 2
+kind = "scalar"
+
+[format]
+line-width = 100
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(config.schema.as_ref().unwrap(), &["schema.sql"]);
+        assert_eq!(config.functions.len(), 2);
+        assert_eq!(config.functions[0].name, "ref");
+        assert_eq!(config.functions[0].arity, Some(-1));
+        assert_eq!(config.functions[1].name, "col");
+        assert_eq!(config.functions[1].arity, Some(2));
+        assert_eq!(config.functions[1].kind.as_deref(), Some("scalar"));
+        assert_eq!(config.format.line_width, Some(100));
     }
 }
